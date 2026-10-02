@@ -793,18 +793,26 @@ class TestRTCExecutionObsSlot:
 
         entered = threading.Event()
         release = threading.Event()
-        returned = threading.Event()
+        processed = threading.Event()
         model = _rtc_model(chunk_size=20, action_dim=3)
 
         def predict(_inputs: dict[str, Any]) -> dict[str, np.ndarray]:
             entered.set()
             assert release.wait(timeout=5.0)
-            returned.set()
             return {"action": np.ones((1, 20, 3), dtype=np.float32)}
 
         model.side_effect = predict
         queue = RTCActionQueue()
         ex = RTCExecution(chunk_size=20, execution_horizon=5, fps=30.0)
+        accept_result = ex._accept_result  # noqa: SLF001
+
+        def tracked_accept(*args: Any, **kwargs: Any) -> np.ndarray | None:  # noqa: ANN401
+            try:
+                return accept_result(*args, **kwargs)
+            finally:
+                processed.set()
+
+        ex._accept_result = tracked_accept  # type: ignore[method-assign]  # noqa: SLF001
         ex.start(model, queue)
         try:
             with (
@@ -816,12 +824,36 @@ class TestRTCExecutionObsSlot:
 
             # The abandoned inference finishes after warmup has already failed.
             release.set()
-            assert returned.wait(timeout=5.0)
-            time.sleep(0.1)
+            assert processed.wait(timeout=5.0)
             assert queue.remaining == 0
             assert ex.inference_count == 0
         finally:
             release.set()
+            ex.stop()
+
+    def test_warmup_accepted_just_after_timeout_is_not_reported_as_failure(self) -> None:
+        from physicalai.runtime import RTCActionQueue, RTCExecution
+        from physicalai.runtime.execution import rtc
+
+        class _LateEvent(threading.Event):
+            """Report a timeout only after the worker has already completed the signal."""
+
+            def wait(self, timeout: float | None = None) -> bool:  # noqa: ARG002
+                assert super().wait(timeout=5.0)
+                return False
+
+        warmup_signal = rtc._WarmupSignal  # noqa: SLF001
+        queue = RTCActionQueue()
+        ex = RTCExecution(chunk_size=20, execution_horizon=5, fps=30.0)
+        ex.start(_rtc_model(chunk_size=20, action_dim=3), queue)
+        try:
+            with patch.object(rtc, "_WarmupSignal", lambda: warmup_signal(event=_LateEvent())):
+                # The chunk is already queued, so warmup must succeed rather than
+                # report a timeout and leave the queue seeded behind its back.
+                ex.warmup({"state": np.zeros(3, dtype=np.float32)})
+            assert queue.remaining == 20
+            assert ex.inference_count == 1
+        finally:
             ex.stop()
 
     def test_start_cancels_existing_warmup_before_refusing_active_worker(self) -> None:

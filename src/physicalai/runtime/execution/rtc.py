@@ -312,14 +312,21 @@ class RTCExecution(Execution):
             self._obs_slot = (deepcopy(sample_observation), incarnation, signal)
 
         # Wait for the first chunk with a generous timeout
+        timed_out = False
         if not signal.event.wait(timeout=_WARMUP_TIMEOUT_S):
             with self._obs_lock:
-                if self._warmup_signal is signal:
-                    self._warmup_signal = None
-                # The abandoned request may still be in the model. Its chunk
-                # must not seed the queue after warmup has reported failure.
-                self._incarnation += 1
-                self._obs_slot = None
+                # The worker completes the signal under this lock, so it may have
+                # accepted the chunk between the wait and here. Only a signal that
+                # is still unset is a timeout.
+                timed_out = not signal.event.is_set()
+                if timed_out:
+                    if self._warmup_signal is signal:
+                        self._warmup_signal = None
+                    # The abandoned request may still be in the model. Its chunk
+                    # must not seed the queue after warmup has reported failure.
+                    self._incarnation += 1
+                    self._obs_slot = None
+        if timed_out:
             if self._death_cause is not None:
                 msg = f"RTC thread died during warmup: {self._death_cause}"
                 raise WorkerDiedError(msg) from self._death_cause
